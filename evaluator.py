@@ -283,22 +283,25 @@ def evaluate_scoring_stability(scores: List[float]) -> dict:
     """
     Assess reliability of repeated independent scores for the same pilot+pairing.
 
-    Used before a main scoring run to check whether the LLM produces consistent
-    scores when called multiple times on the same input. High variance (std > 10)
-    means the ranking derived from a single pass may not be trustworthy.
+    Primary signal: range (max − min). A range > 15 means the score could swing
+    enough to flip the ordering of any two lines within that band — the failure
+    mode that directly corrupts rankings. Secondary signal: std > 8 catches
+    high spread even when a single outlier call keeps the range moderate.
+
+    A run is flagged unstable when EITHER condition holds:
+      range > 15  OR  std > 8
 
     Args:
         scores: List of 0–100 scores from n repeated calls for the same pair.
 
     Returns:
-        dict with keys:
-          mean, std, min, max, coefficient_of_variation (%), stable (bool).
-        stable = True when std <= 10.
+        dict with keys: mean, std, min, max, range,
+                        coefficient_of_variation (%), stable (bool), stability (str).
     """
     if not scores:
         return {
-            "mean": 0.0, "std": 0.0, "min": 0, "max": 0,
-            "coefficient_of_variation": 0.0, "stable": True,
+            "mean": 0.0, "std": 0.0, "min": 0, "max": 0, "range": 0,
+            "coefficient_of_variation": 0.0, "stable": True, "stability": "stable",
         }
 
     n        = len(scores)
@@ -306,16 +309,23 @@ def evaluate_scoring_stability(scores: List[float]) -> dict:
     variance = sum((s - mean) ** 2 for s in scores) / n
     std      = math.sqrt(variance)
     cv       = (std / mean * 100) if mean > 0 else 0.0
+    score_range = max(scores) - min(scores)
 
-    stability = "stable" if std < 5 else ("marginal" if std <= 10 else "unstable")
+    if score_range > 15 or std > 8:
+        stability = "unstable"
+    elif score_range > 8 or std > 4:
+        stability = "marginal"
+    else:
+        stability = "stable"
 
     return {
         "mean":                     round(mean, 1),
         "std":                      round(std, 1),
         "min":                      min(scores),
         "max":                      max(scores),
+        "range":                    round(score_range, 1),
         "coefficient_of_variation": round(cv, 1),
-        "stable":                   std <= 10,   # True for stable + marginal (backwards-compat)
+        "stable":                   stability != "unstable",
         "stability":                stability,   # "stable" | "marginal" | "unstable"
     }
 
