@@ -171,8 +171,10 @@ class Pilot:
 
     @property
     def has_kids(self) -> bool:
-        return any(k in self.family_status.lower()
-                   for k in ('child', 'kids', 'parent'))
+        status = self.family_status.lower()
+        if 'no kids' in status or 'no child' in status:
+            return False
+        return any(k in status for k in ('child', 'kids', 'parent'))
 
     @property
     def is_mid_career(self) -> bool:

@@ -476,7 +476,7 @@ class BradleyTerryModel:
 
     # ------------------------------------------------------------------
     def confidence_intervals(
-        self, n_bootstrap: int = 100
+        self, n_bootstrap: int = 100, rng: Optional[random.Random] = None
     ) -> Dict[int, Tuple[float, float]]:
         """
         Bootstrap confidence intervals on rank positions.
@@ -492,7 +492,8 @@ class BradleyTerryModel:
         for _ in range(n_bootstrap):
             boot_model = BradleyTerryModel(self._ids)
             if n_comp > 0:
-                indices = [random.randrange(n_comp) for _ in range(n_comp)]
+                draw = (rng or random).randrange
+                indices = [draw(n_comp) for _ in range(n_comp)]
                 for idx in indices:
                     wi, li = self._comparisons[idx]
                     boot_model.add_comparison(self._ids[wi], self._ids[li])
@@ -549,6 +550,7 @@ def design_adaptive_comparisons(
     item_ids: List[int],
     provisional_ranking: Optional[List[int]] = None,
     n_uncertain_threshold: int = 2,
+    rng: Optional[random.Random] = None,
 ) -> List[Tuple[int, int]]:
     """
     Design a minimal set of pairwise comparisons.
@@ -563,10 +565,15 @@ def design_adaptive_comparisons(
       AND the pair was not compared in round 1.
       Add these pairs to round 2.
 
+    Round 1's shuffle uses `rng` when supplied, otherwise the global `random`
+    module exactly as before. Callers that need a reproducible design — the
+    harness, which is handed an explicit seed per run — pass their own
+    random.Random; existing callers get the previous behaviour untouched.
+
     Returns list of (item_a_id, item_b_id) tuples for all rounds.
     """
     ids = list(item_ids)
-    random.shuffle(ids)
+    (rng or random).shuffle(ids)
 
     # Round 1: adjacent pairs
     round1: List[Tuple[int, int]] = []

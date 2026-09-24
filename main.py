@@ -23,11 +23,12 @@ Usage (automated mode — requires ANTHROPIC_API_KEY or OPENAI_API_KEY):
 import argparse
 import asyncio
 import json
+import math
 import os
 import random
 import sys
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from models import (
     AdaptivePairwiseResult, LLMLineRank, LLMPairingRank, LineScoringResult,
@@ -420,6 +421,8 @@ async def run_scored_lines(
     model: str,
     n_runs: int = 2,
     batch_size: int = 20,
+    score_fn=None,
+    pairwise_fn=None,
 ) -> Dict[int, List[LineScoringResult]]:
     """
     Score all pilot × line combinations with n_runs independent calls each.
@@ -433,9 +436,17 @@ async def run_scored_lines(
       4. Set ranking_method = "pairwise_tiebreak" on involved lines.
       5. Print per-pilot stability summary and a warning if > 30% unstable.
 
+    score_fn and pairwise_fn override the two LLM-calling steps and default to
+    _score_one_line / _pairwise_one_line, i.e. to the behaviour below. They
+    exist so the harness adapter and the identity tests can drive this exact
+    aggregation logic with substituted responses; nothing about the logic
+    itself changes.
+
     Returns:
         dict: pilot.id → List[LineScoringResult] in final ranked order.
     """
+    score_fn = score_fn or _score_one_line
+    pairwise_fn = pairwise_fn or _pairwise_one_line
     sem = asyncio.Semaphore(batch_size)
 
     # Dispatch all n_runs scoring calls for every pilot × line
@@ -445,7 +456,7 @@ async def run_scored_lines(
     for pilot in pilots:
         for line in lines:
             for _ in range(n_runs):
-                tasks.append(_score_one_line(pilot, line, call_idx, provider, model, sem))
+                tasks.append(score_fn(pilot, line, call_idx, provider, model, sem))
                 task_keys.append((pilot.id, line.id))
                 call_idx += 1
 
@@ -504,7 +515,7 @@ async def run_scored_lines(
             if a.stability == "unstable" or b.stability == "unstable":
                 if abs(a.score_mean - b.score_mean) < a.score_std + b.score_std:
                     pairwise_tasks.append(
-                        _pairwise_one_line(pilot, a.line, b.line, provider, model, sem)
+                        pairwise_fn(pilot, a.line, b.line, provider, model, sem)
                     )
                     pairwise_indices.append((i, i + 1))
 
@@ -1143,11 +1154,21 @@ def _spearman_from_bt(
     return round(num / (dl * do), 2)
 
 
+def _manual_comparison_responder(prompt: str, label: str) -> str:
+    """Print a comparison prompt and read the pasted JSON reply from stdin."""
+    print(label)
+    print(prompt)
+    print("\nPaste JSON response:")
+    return input().strip()
+
+
 def run_adaptive_pairwise_mode(
     pilots: List[Pilot],
     items: List,
     oracle_rankings_by_name: dict,
     is_line: bool,
+    respond=None,
+    rng=None,
 ) -> Dict[int, AdaptivePairwiseResult]:
     """
     Manual adaptive pairwise mode — print prompts and collect responses.
@@ -1157,7 +1178,14 @@ def run_adaptive_pairwise_mode(
       Fit provisional BT model.
       Round 2: run comparisons on uncertain adjacent pairs.
       Fit final BT model and compute CIs.
+
+    respond(prompt, label) -> raw JSON string overrides how a comparison is
+    answered and defaults to printing the prompt and reading stdin, i.e. to
+    the manual behaviour. rng, when supplied, makes the round-1 pair design
+    reproducible. Both are hooks for the harness adapter and the identity
+    tests; the comparison logic and the BT fitting are unchanged.
     """
+    respond = respond or _manual_comparison_responder
     results: Dict[int, AdaptivePairwiseResult] = {}
     item_ids = [item.id for item in items]
 
@@ -1169,7 +1197,7 @@ def run_adaptive_pairwise_mode(
         all_comparisons: List[PairwiseComparison] = []
 
         # Round 1 pairs
-        r1_pairs = design_adaptive_comparisons(item_ids)
+        r1_pairs = design_adaptive_comparisons(item_ids, rng=rng)
         print(f"\nRound 1: {len(r1_pairs)} comparison(s) of {len(item_ids)} items")
 
         item_map = {item.id: item for item in items}
@@ -1177,10 +1205,9 @@ def run_adaptive_pairwise_mode(
             item_a = item_map[a_id]
             item_b = item_map[b_id]
             prompt = adaptive_pairwise_prompt(pilot, item_a, item_b, round_num=1)
-            print(f"\n--- Round 1, Comparison {pair_num}/{len(r1_pairs)} ---")
-            print(prompt)
-            print("\nPaste JSON response:")
-            raw = input().strip()
+            raw = respond(
+                prompt, f"\n--- Round 1, Comparison {pair_num}/{len(r1_pairs)} ---"
+            )
             try:
                 import json as _json
                 d = _json.loads(raw.replace("```json", "").replace("```", "").strip())
@@ -1205,7 +1232,9 @@ def run_adaptive_pairwise_mode(
         prov_ranking = [iid for iid, _ in prov_model.ranking()]
 
         # Round 2 pairs
-        all_pairs = design_adaptive_comparisons(item_ids, provisional_ranking=prov_ranking)
+        all_pairs = design_adaptive_comparisons(
+            item_ids, provisional_ranking=prov_ranking, rng=rng
+        )
         r1_set = {(min(a, b), max(a, b)) for a, b in r1_pairs}
         r2_pairs = [(a, b) for a, b in all_pairs
                     if (min(a, b), max(a, b)) not in r1_set]
@@ -1222,10 +1251,10 @@ def run_adaptive_pairwise_mode(
                 prompt = adaptive_pairwise_prompt(
                     pilot, item_a, item_b, round_num=2, context=context
                 )
-                print(f"\n--- Round 2, Comparison {pair_num}/{len(r2_pairs)} ---")
-                print(prompt)
-                print("\nPaste JSON response:")
-                raw = input().strip()
+                raw = respond(
+                    prompt,
+                    f"\n--- Round 2, Comparison {pair_num}/{len(r2_pairs)} ---",
+                )
                 try:
                     import json as _json
                     d = _json.loads(raw.replace("```json", "").replace("```", "").strip())
