@@ -68,14 +68,19 @@ class Ranking:
 
 
 class RankingMethod(Protocol):
-    """Common protocol for every method. Implementations live in strategies/."""
+    """
+    Common protocol for every method. Implementations live in strategies/.
+
+    Candidates are lines for the bid-line methods and pairings for the PBS
+    column bid; anything with an integer `id` works.
+    """
 
     name: str
 
     def rank(
         self,
         pilot: Pilot,
-        candidates: Sequence[Line],
+        candidates: Sequence[Any],
         *,
         seed: int,
     ) -> Ranking:
@@ -131,6 +136,21 @@ class Instance:
             pairings_per_line=pairings_per_line,
         )
 
+    def candidates(self) -> List[Line]:
+        """What every method ranks: the lines."""
+        return list(self.lines)
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "kind": "bid_line",
+            "n_pilots": len(self.pilots),
+            "n_lines": len(self.lines),
+            "pairings_per_line": self.pairings_per_line,
+            "base": self.base,
+            "pilot_seed": self.pilot_seed,
+            "pairing_seed": self.pairing_seed,
+        }
+
     def oracle_rankings(self) -> Dict[int, Tuple[int, ...]]:
         """pilot.id -> oracle line ids best -> worst. The oracle is unmodified."""
         from oracle import oracle_rank_lines
@@ -163,8 +183,8 @@ class LLMSettings:
     """
     provider: str = "anthropic"
     model: str = "claude-sonnet-5"
-    temperature: float = 1.0
-    max_tokens: int = 4096
+    temperature: Optional[float] = None   # None: provider default (Claude 5 accepts no other)
+    max_tokens: int = 16000
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -179,6 +199,12 @@ class ExperimentRunner:
     """
     Runs a list of methods over one instance set for a number of repetitions
     and writes every result in one consistent format.
+
+    The instance supplies candidates(), oracle_rankings(), oracle_scores() and
+    describe() (harness.Instance for lines, pbs_instance.PBSInstance for
+    pairings). It may also supply extra_metrics(ranking) -> dict, merged into
+    each run's metrics and averaged like the others, and pilot_metadata(pilot)
+    -> dict, merged into the pilot records.
     """
 
     def __init__(
@@ -213,12 +239,14 @@ class ExperimentRunner:
         failures: List[Dict[str, Any]] = []
 
         for method in methods:
+            client = getattr(method, "client", None)
             for pilot in self.instance.pilots:
                 for rep in range(n_reps):
                     seed = self._seed_for(pilot.id, rep)
+                    calls_before = getattr(client, "n_calls", None)
                     try:
                         r = method.rank(
-                            pilot, list(self.instance.lines), seed=seed
+                            pilot, self.instance.candidates(), seed=seed
                         )
                     except Exception as exc:  # noqa: BLE001 - recorded, not hidden
                         if on_error == "raise":
@@ -232,13 +260,17 @@ class ExperimentRunner:
                         continue
 
                     rankings.setdefault((method.name, pilot.id), []).append(r)
-                    rows.append(self._row(r, rep, seed, oracle[pilot.id]))
+                    row = self._row(r, rep, seed, oracle[pilot.id])
+                    if calls_before is not None:
+                        row["cost"]["llm_calls"] = client.n_calls - calls_before
+                    rows.append(row)
 
+        per_pilot = self._per_pilot(rankings, rows)
         return {
             "metadata": self._metadata(n_reps, methods),
             "runs": rows,
-            "per_pilot": self._per_pilot(rankings, oracle),
-            "aggregate": self._aggregate(rankings, oracle),
+            "per_pilot": per_pilot,
+            "aggregate": self._aggregate(per_pilot),
             "failures": failures,
         }
 
@@ -266,77 +298,85 @@ class ExperimentRunner:
             "ordered_ids": list(r.ordered_ids),
             "scores": ({str(k): v for k, v in r.scores.items()}
                        if r.scores is not None else None),
-            "metrics": {
-                "spearman": M.spearman(r.ordered_ids, oracle_order),
-                "kendall_tau_b": M.kendall_tau_b(r.ordered_ids, oracle_order),
-                "top3_accuracy": M.top3_accuracy(r.ordered_ids, oracle_order),
-                "top3_set_overlap": M.top3_set_overlap(r.ordered_ids, oracle_order),
-                "tie_rate": M.tie_rate(r.scores),
+            "metrics": self._metrics(r, oracle_order),
+            "cost": {
+                "llm_calls": None,
+                "feedback_rounds": r.artifacts.get("feedback_rounds"),
             },
             "artifacts": r.artifacts,
         }
 
+    def _metrics(self, r: Ranking, oracle_order: Tuple[int, ...]) -> Dict[str, Any]:
+        import metrics as M
+
+        out: Dict[str, Any] = {
+            "spearman": M.spearman(r.ordered_ids, oracle_order),
+            "kendall_tau_b": M.kendall_tau_b(r.ordered_ids, oracle_order),
+            "top3_accuracy": M.top3_accuracy(r.ordered_ids, oracle_order),
+            "top3_set_overlap": M.top3_set_overlap(r.ordered_ids, oracle_order),
+            "tie_rate": M.tie_rate(r.scores),
+        }
+        extra = getattr(self.instance, "extra_metrics", None)
+        if extra is not None:
+            out.update(extra(r))
+        return out
+
     def _per_pilot(
         self,
         rankings: Dict[Tuple[str, int], List[Ranking]],
-        oracle: Dict[int, Tuple[int, ...]],
+        rows: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """
+        Per (method, pilot): every run metric averaged over repetitions (None
+        values skipped, None if all are None), plus run-to-run consistency,
+        mean number of activated columns and mean cost.
+        """
         import metrics as M
+
+        grouped: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault((row["method"], row["pilot_id"]), []).append(row)
 
         out: List[Dict[str, Any]] = []
         for (method_name, pilot_id), reps in sorted(rankings.items()):
-            orders = [r.ordered_ids for r in reps]
-            ora = oracle[pilot_id]
-            ties = [M.tie_rate(r.scores) for r in reps]
-            ties = [t for t in ties if t is not None]
-            out.append({
+            prow = grouped[(method_name, pilot_id)]
+            entry: Dict[str, Any] = {
                 "method": method_name,
                 "variant": reps[0].variant,
                 "pilot_id": pilot_id,
                 "n_reps": len(reps),
-                "spearman": M.mean([M.spearman(o, ora) for o in orders]),
-                "kendall_tau_b": M.mean([M.kendall_tau_b(o, ora) for o in orders]),
-                "consistency": M.run_consistency(orders),
-                "top3_accuracy": M.mean([M.top3_accuracy(o, ora) for o in orders]),
-                "top3_set_overlap": M.mean(
-                    [M.top3_set_overlap(o, ora) for o in orders]
-                ),
-                "tie_rate": M.mean(ties) if ties else None,
-                "n_selected": M.mean([
-                    r.artifacts["n_selected"] for r in reps
-                    if "n_selected" in r.artifacts
-                ]) or None,
-            })
+            }
+            for key in prow[0]["metrics"]:
+                entry[key] = M.mean(r["metrics"][key] for r in prow)
+            entry["consistency"] = M.run_consistency([r.ordered_ids for r in reps])
+            entry["n_selected"] = M.mean(
+                r.artifacts["n_selected"] for r in reps if "n_selected" in r.artifacts
+            )
+            entry["llm_calls"] = M.mean(r["cost"]["llm_calls"] for r in prow)
+            entry["feedback_rounds"] = M.mean(r["cost"]["feedback_rounds"] for r in prow)
+            out.append(entry)
         return out
 
-    def _aggregate(
-        self,
-        rankings: Dict[Tuple[str, int], List[Ranking]],
-        oracle: Dict[int, Tuple[int, ...]],
-    ) -> List[Dict[str, Any]]:
+    def _aggregate(self, per_pilot: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Per method: every numeric per-pilot column averaged over pilots."""
         import metrics as M
 
         by_method: Dict[str, List[Dict[str, Any]]] = {}
-        for row in self._per_pilot(rankings, oracle):
+        for row in per_pilot:
             by_method.setdefault(row["method"], []).append(row)
 
+        skip = {"method", "variant", "pilot_id", "n_reps"}
         out: List[Dict[str, Any]] = []
-        for method_name, per_pilot in sorted(by_method.items()):
-            def col(key: str) -> Optional[float]:
-                vals = [r[key] for r in per_pilot if r[key] is not None]
-                return M.mean(vals) if vals else None
-
-            out.append({
+        for method_name, rows in sorted(by_method.items()):
+            entry: Dict[str, Any] = {
                 "method": method_name,
-                "variant": per_pilot[0]["variant"],
-                "n_pilots": len(per_pilot),
-                "spearman": col("spearman"),
-                "kendall_tau_b": col("kendall_tau_b"),
-                "consistency": col("consistency"),
-                "top3_accuracy": col("top3_accuracy"),
-                "top3_set_overlap": col("top3_set_overlap"),
-                "tie_rate": col("tie_rate"),
-            })
+                "variant": rows[0]["variant"],
+                "n_pilots": len(rows),
+            }
+            for key in rows[0]:
+                if key not in skip:
+                    entry[key] = M.mean(r[key] for r in rows)
+            out.append(entry)
         return out
 
     def _metadata(
@@ -352,14 +392,7 @@ class ExperimentRunner:
             "methods": [m.name for m in methods],
             "llm": self.llm.as_dict(),
             "base_seed": self.base_seed,
-            "instance": {
-                "n_pilots": len(self.instance.pilots),
-                "n_lines": len(self.instance.lines),
-                "pairings_per_line": self.instance.pairings_per_line,
-                "base": self.instance.base,
-                "pilot_seed": self.instance.pilot_seed,
-                "pairing_seed": self.instance.pairing_seed,
-            },
+            "instance": self.instance.describe(),
             "pilots": [
                 {
                     "id": p.id,
@@ -369,13 +402,13 @@ class ExperimentRunner:
                     "seniority": p.seniority,
                     "qualified_types": list(p.qualified_types),
                     "base_pay": p.base_pay,
-                    "monthly_instructions": getattr(p, "monthly_instructions", ""),
                     "oracle_weights": {
                         "tafb": p.weights.tafb,
                         "hotel_nights": p.weights.hotel_nights,
                         "report_time": p.weights.report_time,
                         "credit_pay": p.weights.credit_pay,
                     },
+                    **self._pilot_extra(p),
                 }
                 for p in self.instance.pilots
             ],
@@ -384,6 +417,10 @@ class ExperimentRunner:
                 for pid, scores in oracle_scores.items()
             },
         }
+
+    def _pilot_extra(self, pilot: Pilot) -> Dict[str, Any]:
+        extra = getattr(self.instance, "pilot_metadata", None)
+        return extra(pilot) if extra is not None else {}
 
     # ------------------------------------------------------------------
     @staticmethod

@@ -474,3 +474,36 @@ Lines group pairings into monthly schedules — the unit pilots bid on in line m
 **Key invariant — aircraft qualification**: B737 pairings are placed into lines before B767 pairings, ensuring the first lines in the pool are all-B737 so B737-only pilots always have fully-qualified options. A line requires qualification on every pairing it contains.
 
 **Conflict detection**: `Line.has_conflicts()` checks whether any two pairings overlap on the calendar (using a 6-day spacing convention). The generator does not enforce conflict-free lines automatically — callers can filter or regenerate if needed.
+
+---
+
+## PBS pipeline: column selection and weighting (research note, Steps 1–6)
+
+The bid-line code above ranks whole monthly lines. The PBS pipeline instead has the LLM write a **bid over pairing features**, and the ranking of pairings follows from it. The PBS solver (Step 7) is not built yet; everything up to its input is.
+
+| Module | Role |
+|---|---|
+| `features.py` | Feature library K (continuous columns, 0/1 indicators incl. one `touches_day_<d>` / `away_evening_<d>` column per day of the bid month and one `layover_<CODE>` per airport, schedule-level columns for the solver) and the matrix Φ, min-max normalised over the pairing set J |
+| `instructions.py` | Monthly instructions ι: seeded free-text requests (days/weekends off, soft or firm; home for an evening; long/short trips; want/avoid a layover city; no early reports; one layover in X; two free weekends), each with the columns it maps to and compliance checks on a ranking and on a schedule |
+| `bid.py` | The bid (z, w, σ, hard exclusions, schedule preferences), the score s_p(j) = Σ w·σ·φ̃ (eq. 2), the tiered pairing ranking, rank-order-centroid weights, and the **bid-form oracle** |
+| `pbs_instance.py` | Pilots + dated pairings + K + Φ + ι + oracle; oracle feedback for R4; section-5 metrics |
+| `bid_prompts.py`, `strategies/column_bid.py` | The LLM method: `separated` (selection call, then weighting call) or `joint` (one call); regimes R1 blind, R2 full trip table, R3 (1−α)B blind + αB informed (optionally on a sample), R4 blind + feedback rounds on a shortlist; `budget` or `rank` weights. Schema violations are sent back to the model; after `max_retries` the reply is repaired and flagged |
+| `oracle_responder.py` | Scripted "perfect LLM" answering from the oracle, for dry runs and tests |
+| `run_pbs_experiment.py` | Command-line runner |
+
+```bash
+# no API calls: every variant, answered from the oracle (budget variants must give rho = 1)
+python run_pbs_experiment.py --all-variants --dry-run
+
+# real runs (model from .env, e.g. claude-sonnet-5 on Parley)
+python run_pbs_experiment.py --variants separated:R1:budget joint:R1:budget \
+    separated:R2:budget separated:R3:budget separated:R4:budget --reps 3 --out pbs_results.json
+```
+
+**Bid-form oracle.** The base oracle's four weights (per archetype, sum 100) are rescaled to the budget B (default 10) over the columns `tafb`, `hotel_nights` (σ = −1 for family pilots, +1 otherwise), `report_earliness` (minutes before 07:00, which reproduces the base oracle's flat-after-07:00 report score) and `credit_pay`. Each soft instruction takes a designer-chosen share of B, split over its columns; an instruction on a base column with the opposite direction (e.g. "long trips") overrides it. Firm instructions become hard exclusions (those pairings go to the bottom, flagged *avoid*); schedule-level wishes become schedule preferences for the solver. Instructions are capped at 60% of B. Without instructions, the bid-form oracle's pairing ranking tracks `oracle_rank_pilot` at ρ ≈ 0.76–0.99 (the gap comes from normalising over J instead of fixed bounds).
+
+**Direction per pilot.** The note writes σ_k per feature, but its own example ("long trips" → TAFB with σ = +1) needs the direction chosen per pilot, so the bid carries σ_pk and the library's σ_k is only the default.
+
+**Metrics** (per run, averaged per pilot and per method): Spearman ρ, Kendall τ-b, top-3/5/10 against the oracle ranking r*; selection precision/recall/F1 against z*; weight error ‖w − w*‖₁/(2B); direction accuracy; hard-exclusion F1; instruction compliance of r_p (firm and soft separately, on the top-10 shortlist); run-to-run consistency; tie rate; LLM calls and feedback rounds. `PBSInstance.schedule_outcome` computes oracle satisfaction and schedule compliance for a PBS schedule once the solver exists.
+
+**Known limits.** Pairing-level preferences only feed the ranking; schedule-level ones are collected but unused until the solver exists. The generator produces no red-eyes and no releases after 20:00, so those columns are constant and cannot move a score. Even a perfect *ordinal* bid reaches only ρ ≈ 0.72 because rank-order-centroid weights lose the budget information: read the `rank` variants against that ceiling, not 1.
