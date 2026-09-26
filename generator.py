@@ -192,6 +192,9 @@ class ScenarioGenerator:
         """
         rng    = self._prng_pilot
         names  = rng.sample(PILOT_NAMES, min(n, len(PILOT_NAMES)))
+        # Beyond the named pool, pilots get generic names. The draws above are
+        # unchanged, so for n <= 10 the pilots are exactly as before.
+        names += [f"Pilot {k}" for k in range(len(names) + 1, n + 1)]
         pilots = []
 
         for i, name in enumerate(names):
