@@ -186,3 +186,76 @@ def tie_rate(scores: Optional[Dict[int, float]]) -> Optional[float]:
         1 for x, y in itertools.combinations(vals, 2) if x == y
     )
     return round(tied / (n * (n - 1) / 2), 4)
+
+
+# ---------------------------------------------------------------------------
+# PBS bid metrics (research note, section 5)
+# ---------------------------------------------------------------------------
+
+def top_k_overlap(order: Sequence[int], reference: Sequence[int], k: int) -> float:
+    """Fraction of the reference's top k that appears in the method's top k."""
+    k = min(k, len(reference))
+    if k == 0 or not order:
+        return 0.0
+    return round(len(set(order[:k]) & set(reference[:k])) / k, 4)
+
+
+def selection_prf(
+    selected: Iterable[str], truth: Iterable[str]
+) -> Dict[str, float]:
+    """
+    Precision, recall and F1 of an activated-column set z_p against z*_p.
+
+    Both empty counts as perfect; one empty and the other not as 0.
+    """
+    s, t = set(selected), set(truth)
+    if not s and not t:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
+    tp = len(s & t)
+    p = tp / len(s) if s else 0.0
+    r = tp / len(t) if t else 0.0
+    f1 = 2 * p * r / (p + r) if p + r else 0.0
+    return {"precision": round(p, 4), "recall": round(r, 4), "f1": round(f1, 4)}
+
+
+def weight_error(
+    weights: Dict[str, float], truth: Dict[str, float], budget: float
+) -> float:
+    """
+    ||w - w*||_1 / (2B), in [0, 1] when both sum to B.
+
+    0 is the same allocation; 1 means no budget on any shared column. Missing
+    columns count as weight 0, so selection errors show up here too.
+    """
+    keys = set(weights) | set(truth)
+    l1 = sum(abs(weights.get(k, 0.0) - truth.get(k, 0.0)) for k in keys)
+    return round(l1 / (2 * budget), 4)
+
+
+def direction_accuracy(
+    directions: Dict[str, int], truth: Dict[str, int]
+) -> Optional[float]:
+    """Share of columns weighted in both bids whose direction sigma agrees."""
+    shared = set(directions) & set(truth)
+    if not shared:
+        return None
+    return round(sum(directions[k] == truth[k] for k in shared) / len(shared), 4)
+
+
+def rate(flags: Iterable[Optional[bool]]) -> Optional[float]:
+    """Share of True among the non-None flags; None if there are none."""
+    vals = [f for f in flags if f is not None]
+    if not vals:
+        return None
+    return round(sum(1 for f in vals if f) / len(vals), 4)
+
+
+def oracle_satisfaction(
+    schedule_ids: Iterable[int], oracle_scores: Dict[int, float]
+) -> float:
+    """
+    S*_p(x_p) for the pairing part: the sum of the oracle's pairing scores
+    s*_p(j) over the pairings in the schedule. Schedules differ in length, so
+    compare it alongside the schedule-level instruction compliance.
+    """
+    return round(sum(oracle_scores[j] for j in schedule_ids), 4)
