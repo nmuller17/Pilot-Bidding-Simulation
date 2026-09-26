@@ -686,6 +686,7 @@ def export_results(
             "num_legs": p.num_legs,
             "nights_away": p.nights_away,
             "start_dow": p.start_dow,
+            "start_date": p.start_date.isoformat(),
             "tafb_h": p.tafb,
             "block_hours": p.block_hours,
             "credit_hours": p.credit_hours,

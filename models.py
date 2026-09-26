@@ -8,10 +8,23 @@ Mirrors the data structures in the HTML POC.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from datetime import date, datetime, timedelta
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     from evaluator import BradleyTerryModel
+
+
+# ---------------------------------------------------------------------------
+# Duty-time conventions
+# ---------------------------------------------------------------------------
+
+# All leg times are on one clock (the home base's local time); the airport
+# time zones in generator.AIRPORTS are not applied.
+REPORT_BEFORE_MINS = 60   # report 60 min before first departure
+RELEASE_AFTER_MINS = 30   # released 30 min after last arrival (debrief)
+
+_WEEKDAYS = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
 
 
 # ---------------------------------------------------------------------------
@@ -76,9 +89,60 @@ class Pairing:
     base:           str    # home base airport e.g. 'BOS'
     legs:           List[Leg]
     nights_away:    int
-    start_dow:      str    # 'Mon', 'Tue', ...
+    start_date:     date   # calendar date of Day1 (the first departure)
     hotel_quality:  str = 'Standard'  # fixed per POC decision
     min_seniority:  int = 999         # unused — all open to all pilots
+
+    # ------------------------------------------------------------------
+    # Calendar placement
+    # ------------------------------------------------------------------
+
+    @property
+    def start_dow(self) -> str:
+        """Day of week of Day1, e.g. 'Tue'."""
+        return _WEEKDAYS[self.start_date.weekday()]
+
+    @property
+    def start_label(self) -> str:
+        """Weekday and ISO date, e.g. 'Tue 2026-10-06'."""
+        return f"{self.start_dow} {self.start_date.isoformat()}"
+
+    @property
+    def end_date(self) -> date:
+        """Calendar date of the last arrival."""
+        return self.start_date + timedelta(days=self.legs[-1].arr_day - 1)
+
+    @property
+    def calendar_days(self) -> int:
+        """Number of calendar days the trip touches, start to end inclusive."""
+        return self.legs[-1].arr_day
+
+    def _abs_time(self, day: int, time_str: str) -> datetime:
+        base = datetime.combine(self.start_date, datetime.min.time())
+        return base + timedelta(days=day - 1, minutes=self._time_to_mins(time_str))
+
+    @property
+    def report_dt(self) -> datetime:
+        """Start of duty: REPORT_BEFORE_MINS before the first departure."""
+        first = self.legs[0]
+        return self._abs_time(first.dep_day, first.dep_time) - timedelta(minutes=REPORT_BEFORE_MINS)
+
+    @property
+    def release_dt(self) -> datetime:
+        """End of duty: RELEASE_AFTER_MINS after the last arrival."""
+        last = self.legs[-1]
+        return self._abs_time(last.arr_day, last.arr_time) + timedelta(minutes=RELEASE_AFTER_MINS)
+
+    @property
+    def layover_rests(self) -> List[timedelta]:
+        """Hotel rest at each overnight: release after one day's last leg to report for the next."""
+        rests = []
+        for a, b in zip(self.legs, self.legs[1:]):
+            if b.dep_day > a.arr_day:
+                off = self._abs_time(a.arr_day, a.arr_time) + timedelta(minutes=RELEASE_AFTER_MINS)
+                on  = self._abs_time(b.dep_day, b.dep_time) - timedelta(minutes=REPORT_BEFORE_MINS)
+                rests.append(on - off)
+        return rests
 
     @property
     def num_legs(self) -> int:
@@ -361,31 +425,17 @@ class Line:
     # Conflict detection
     # ------------------------------------------------------------------
 
-    def _pairing_day_span(self, pairing: Pairing) -> tuple:
-        """
-        Estimate the calendar day range for a pairing within the month.
-
-        Convention: pairing with id=i starts at day (i-1)*6 + 1,
-        giving ~6-day spacing between consecutive pairings.
-        End day = start + nights_away + 1 (one report day + flying days).
-        """
-        start = (pairing.id - 1) * 6 + 1
-        end   = start + pairing.nights_away + 1
-        return start, end
-
     def has_conflicts(self) -> bool:
-        """
-        True if any two pairings in this line overlap in calendar time.
-        Two pairings A and B overlap when A.start <= B.end AND B.start <= A.end.
-        """
-        spans = [self._pairing_day_span(p) for p in self.pairings]
-        for i in range(len(spans)):
-            for j in range(i + 1, len(spans)):
-                a_start, a_end = spans[i]
-                b_start, b_end = spans[j]
-                if a_start <= b_end and b_start <= a_end:
-                    return True
-        return False
+        """True if the duty periods of any two pairings in this line overlap."""
+        return any(v.kind == 'overlap' for v in schedule_violations(self.pairings))
+
+    def schedule_violations(self, min_rest_hours: float = 0) -> List["ScheduleViolation"]:
+        """Overlaps and rest shortfalls between this line's pairings."""
+        return schedule_violations(self.pairings, min_rest_hours)
+
+    def is_legal_for(self, pilot: "Pilot") -> bool:
+        """No overlaps and at least pilot.min_rest hours at base between trips."""
+        return not self.schedule_violations(pilot.min_rest)
 
     # ------------------------------------------------------------------
     # Pilot-specific helpers
@@ -402,6 +452,59 @@ class Line:
     def is_qualified(self, pilot: "Pilot") -> bool:
         """True if the pilot is qualified for every aircraft type in this line."""
         return all(p.is_qualified(pilot) for p in self.pairings)
+
+
+# ---------------------------------------------------------------------------
+# Schedule legality (any set of pairings flown by one pilot)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScheduleViolation:
+    """
+    A problem between two pairings flown by the same pilot, in time order.
+
+    kind 'overlap': `later` reports before `earlier` is released.
+    kind 'rest':    the rest at base between them is under the required minimum.
+    """
+    kind:    str
+    earlier: Pairing
+    later:   Pairing
+    rest:    timedelta   # later.report_dt - earlier.release_dt (negative for overlaps)
+
+
+def rest_between(earlier: Pairing, later: Pairing) -> timedelta:
+    """Rest at base from `earlier`'s release to `later`'s report."""
+    return later.report_dt - earlier.release_dt
+
+
+def schedule_violations(
+    pairings: Sequence[Pairing], min_rest_hours: float = 0,
+) -> List[ScheduleViolation]:
+    """
+    Every overlap and rest shortfall in a schedule, in time order.
+
+    Overlaps are checked between all pairs, so a long trip that swallows a
+    later short one is caught. Rest is checked between consecutive
+    non-overlapping trips. min_rest_hours=0 checks overlaps only.
+    """
+    ordered = sorted(pairings, key=lambda p: p.report_dt)
+    min_rest = timedelta(hours=min_rest_hours)
+    out: List[ScheduleViolation] = []
+    for i, a in enumerate(ordered):
+        for b in ordered[i + 1:]:
+            if b.report_dt >= a.release_dt:
+                break  # sorted by report time: nothing later overlaps a
+            out.append(ScheduleViolation('overlap', a, b, rest_between(a, b)))
+    for a, b in zip(ordered, ordered[1:]):
+        gap = rest_between(a, b)
+        if timedelta(0) <= gap < min_rest:
+            out.append(ScheduleViolation('rest', a, b, gap))
+    return out
+
+
+def is_legal_schedule(pairings: Sequence[Pairing], min_rest_hours: float) -> bool:
+    """True if the pairings can all be flown by one pilot with this minimum rest."""
+    return not schedule_violations(pairings, min_rest_hours)
 
 
 # ---------------------------------------------------------------------------

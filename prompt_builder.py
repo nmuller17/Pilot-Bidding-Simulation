@@ -105,8 +105,7 @@ def _pairing_summary(pilot: Pilot, pair: Pairing, ctx: Optional[Dict] = None) ->
     total_value = pair.total_trip_value(pilot.base_pay)
     qualified   = "yes" if pair.is_qualified(pilot) else "NO — pilot not qualified for this aircraft"
 
-    dow_list = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    start_dow = pair.start_dow if pair.start_dow in dow_list else "—"
+    start_dow = pair.start_label
 
     if ctx:
         pay_rel    = _pay_label(pilot_pay, ctx["mean_pay"])
@@ -394,7 +393,7 @@ def _line_summary(pilot: Pilot, line: Line, ctx: Optional[Dict] = None) -> str:
             leg_parts.append(f"Day{l.dep_day} {l.dep_time} {l.dep}→{l.arr} arr {l.arr_time}")
             if i < len(p.legs) - 1 and p.legs[i + 1].dep_day > l.arr_day:
                 leg_parts.append("(hotel)")
-        sched_rows.append(f"    P{p.id} ({p.start_dow}): " + " | ".join(leg_parts))
+        sched_rows.append(f"    P{p.id} ({p.start_label}): " + " | ".join(leg_parts))
     schedule_block = "\n".join(sched_rows)
 
     if ctx:

@@ -12,7 +12,9 @@ Usage:
     pairings = gen.build_pairings(n=5, pilots=pilots, base='BOS')
 """
 
+import calendar
 import random
+from datetime import date, timedelta
 from typing import List, Optional
 
 from models import Leg, Line, Pairing, Pilot, OracleWeights
@@ -89,6 +91,12 @@ FAMILY_OPTIONS = [
 
 DOW = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+DEFAULT_BID_MONTH = date(2026, 10, 1)
+
+# Minimum full calendar days off at base between two trips in a built line.
+# One day off guarantees >= 24h rest, above every pilot's min_rest (10-14h).
+MIN_DAYS_OFF_BETWEEN_TRIPS = 1
+
 # ---------------------------------------------------------------------------
 # Delta 2023 Captain pay rates (Section 3 B.2)
 # ---------------------------------------------------------------------------
@@ -154,11 +162,24 @@ class ScenarioGenerator:
                   (change to get different pilot profiles)
     pairing_seed: controls pairing route/schedule randomness
                   (change to get different pairings)
+    bid_month:    any date in the month being bid; pairings are dated in it
+
+    Start dates come from their own PRNG (derived from pairing_seed), so for
+    a given seed the pairings' routes and times and the line groupings are
+    the same as before dates existed.
     """
 
-    def __init__(self, pilot_seed: int = 1234567, pairing_seed: int = 42):
+    def __init__(
+        self,
+        pilot_seed: int = 1234567,
+        pairing_seed: int = 42,
+        bid_month: date = DEFAULT_BID_MONTH,
+    ):
         self._prng_pilot   = random.Random(pilot_seed)
         self._prng_pairing = random.Random(pairing_seed)
+        self._prng_dates   = random.Random(f"dates-{pairing_seed}")
+        self.month_start   = bid_month.replace(day=1)
+        self.days_in_month = calendar.monthrange(bid_month.year, bid_month.month)[1]
 
     # ------------------------------------------------------------------
     # Pilots
@@ -242,7 +263,7 @@ class ScenarioGenerator:
                 b767_count += 1
             num_legs      = rng.choice([2, 3, 3, 4])   # weighted toward 3
             nights_away   = num_legs - 1
-            start_dow     = rng.choice(DOW)
+            _ = rng.choice(DOW)  # former start_dow draw; kept so the seed stream is unchanged
 
             # Pick intermediate stops (unique per pairing)
             stops = rng.sample(airport_pool, num_legs - 1)
@@ -307,13 +328,43 @@ class ScenarioGenerator:
                 base=base,
                 legs=legs,
                 nights_away=nights_away,
-                start_dow=start_dow,
+                start_date=self._random_start_date(legs[-1].arr_day),
                 hotel_quality="Standard",
                 min_seniority=999,  # all open to all pilots
             )
             pairings.append(pairing)
 
         return pairings
+
+    def _random_start_date(self, calendar_days: int) -> date:
+        """A uniform start date that keeps the whole trip inside the month."""
+        last_start = self.days_in_month - calendar_days + 1
+        return self.month_start + timedelta(days=self._prng_dates.randint(0, last_start - 1))
+
+    def _lay_out_line(self, pairings: List[Pairing]) -> None:
+        """
+        Re-date a line's pairings, in list order, so they fit in the month
+        with at least MIN_DAYS_OFF_BETWEEN_TRIPS days off between trips.
+        Spare days are spread at random over the gaps before, between and
+        after the trips.
+        """
+        spans = [p.calendar_days for p in pairings]
+        min_gaps = MIN_DAYS_OFF_BETWEEN_TRIPS * (len(pairings) - 1)
+        spare = self.days_in_month - sum(spans) - min_gaps
+        if spare < 0:
+            raise ValueError(
+                f"{len(pairings)} trips covering {sum(spans)} days do not fit in a "
+                f"{self.days_in_month}-day month with {MIN_DAYS_OFF_BETWEEN_TRIPS} day(s) off between them."
+            )
+        # Split `spare` into len+1 non-negative parts (stars and bars).
+        rng  = self._prng_dates
+        cuts = sorted(rng.randint(0, spare) for _ in range(len(pairings)))
+        extra = [b - a for a, b in zip([0] + cuts, cuts + [spare])]
+
+        day = extra[0]   # 0-indexed day of month
+        for i, (p, span) in enumerate(zip(pairings, spans)):
+            p.start_date = self.month_start + timedelta(days=day)
+            day += span + MIN_DAYS_OFF_BETWEEN_TRIPS + extra[i + 1]
 
     # ------------------------------------------------------------------
     # Lines
@@ -331,6 +382,10 @@ class ScenarioGenerator:
         Rules:
         - Each pairing belongs to exactly one line.
         - Uses the seeded pairing PRNG for reproducible shuffling.
+        - Re-dates each line's pairings (overwriting the dates from
+          build_pairings) so every line is a conflict-free month with at
+          least one day off between trips. Pairing order within a line is
+          chronological.
         - Raises ValueError if n_lines * pairings_per_line > len(pairings).
 
         Args:
@@ -368,6 +423,7 @@ class ScenarioGenerator:
         for line_idx in range(n_lines):
             start = line_idx * pairings_per_line
             line_pairings = pool[start : start + pairings_per_line]
+            self._lay_out_line(line_pairings)
             lines.append(Line(id=line_idx + 1, pairings=line_pairings))
 
         return lines
