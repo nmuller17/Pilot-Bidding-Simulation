@@ -145,6 +145,11 @@ class Pairing:
         return rests
 
     @property
+    def layover_airports(self) -> List[str]:
+        """Airport code of each overnight, in trip order."""
+        return [a.arr for a, b in zip(self.legs, self.legs[1:]) if b.dep_day > a.arr_day]
+
+    @property
     def num_legs(self) -> int:
         return len(self.legs)
 
