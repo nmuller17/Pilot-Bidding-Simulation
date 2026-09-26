@@ -10,14 +10,19 @@ different token budgets (4096 / 512 / 256). That is fine for the pre-existing
 code paths, which this module does not touch, but the four-method comparison
 needs one configuration applied uniformly and recorded in the results.
 
-Temperature is pinned explicitly to the Anthropic default of 1.0 rather than
-left unset. The request is behaviourally identical to the pre-existing calls,
-but the value can now go into the cache key and the results metadata instead
-of being an implicit server-side default that could change under us.
+Sampling temperature is NOT sent to Anthropic. Claude Sonnet 5 / Opus 5 and
+later reject temperature, top_p and top_k with a 400, and anthropic SDK 1.x has
+no such parameter. `temperature` defaults to None (provider default) and is only
+forwarded on the OpenAI route when set; the value used is recorded in the
+results metadata either way.
 
-Token budget is unified upward to 4096, the largest the pre-existing code
-used. Raising a cap can only avoid truncation, never introduce it, so the
-existing methods' outputs are unaffected.
+Claude 5 models think adaptively by default, so a response can start with a
+thinking block: the reply is the concatenation of the text blocks, never
+content[0]. A refusal or a reply cut off at max_tokens raises LLMError instead
+of returning partial JSON.
+
+Token budget is 16000 (thinking tokens count against it). Raising a cap can
+only avoid truncation, never introduce it.
 
 Keys and base URL come from the environment only:
 
@@ -62,13 +67,14 @@ class LLMClient:
         self,
         provider: str = "anthropic",
         model: str = "claude-sonnet-5",
-        temperature: float = 1.0,
-        max_tokens: int = 4096,
+        temperature: Optional[float] = None,
+        max_tokens: int = 16000,
     ):
         self.provider = provider
         self.model = model
         self.temperature = temperature
         self.max_tokens = max_tokens
+        self.n_calls = 0   # every request made through this client, for cost reporting
 
     # ------------------------------------------------------------------
     @classmethod
@@ -83,11 +89,13 @@ class LLMClient:
 
     # ------------------------------------------------------------------
     def complete(self, prompt: str) -> str:
+        self.n_calls += 1
         if self.provider == "anthropic":
             return self._anthropic_sync(prompt)
         return self._openai_sync(prompt)
 
     async def acomplete(self, prompt: str) -> str:
+        self.n_calls += 1
         if self.provider == "anthropic":
             return await self._anthropic_async(prompt)
         return await self._openai_async(prompt)
@@ -104,10 +112,9 @@ class LLMClient:
         msg = client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            temperature=self.temperature,
             messages=[{"role": "user", "content": prompt}],
         )
-        return msg.content[0].text
+        return _anthropic_text(msg)
 
     async def _anthropic_async(self, prompt: str) -> str:
         try:
@@ -120,10 +127,9 @@ class LLMClient:
         msg = await client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            temperature=self.temperature,
             messages=[{"role": "user", "content": prompt}],
         )
-        return msg.content[0].text
+        return _anthropic_text(msg)
 
     def _openai_sync(self, prompt: str) -> str:
         try:
@@ -136,8 +142,8 @@ class LLMClient:
         resp = client.chat.completions.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            temperature=self.temperature,
             messages=[{"role": "user", "content": prompt}],
+            **self._openai_sampling(),
         )
         return resp.choices[0].message.content or ""
 
@@ -152,10 +158,27 @@ class LLMClient:
         resp = await client.chat.completions.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            temperature=self.temperature,
             messages=[{"role": "user", "content": prompt}],
+            **self._openai_sampling(),
         )
         return resp.choices[0].message.content or ""
+
+
+    def _openai_sampling(self) -> dict:
+        return {} if self.temperature is None else {"temperature": self.temperature}
+
+
+def _anthropic_text(msg) -> str:
+    """The reply text of a Messages API response; raises on refusal or truncation."""
+    if msg.stop_reason == "refusal":
+        details = getattr(msg, "stop_details", None)
+        raise LLMError(f"model refused (category: {getattr(details, 'category', None)})")
+    if msg.stop_reason == "max_tokens":
+        raise LLMError("reply cut off at max_tokens; raise max_tokens")
+    text = "".join(b.text for b in msg.content if b.type == "text")
+    if not text:
+        raise LLMError(f"no text in the reply (stop_reason: {msg.stop_reason})")
+    return text
 
 
 class StubClient(LLMClient):
@@ -175,6 +198,7 @@ class StubClient(LLMClient):
         self._i = 0
 
     def _next(self, prompt: str) -> str:
+        self.n_calls += 1
         self.prompts.append(prompt)
         if not self._responses:
             raise LLMError("StubClient has no responses configured")
