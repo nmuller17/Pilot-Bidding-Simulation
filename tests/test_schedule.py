@@ -11,7 +11,7 @@ import os
 import sys
 from datetime import date, datetime, timedelta
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 
 from generator import ScenarioGenerator
 from models import Leg, Line, Pairing, is_legal_schedule, schedule_violations

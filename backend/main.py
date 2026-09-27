@@ -51,6 +51,7 @@ from allocator import (
     llm_allocation, compare_allocations, format_allocation_report,
 )
 from llm_api import call_llm
+from paths import RESULTS_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -1499,7 +1500,7 @@ def main():
         "--consistency-runs", type=int, default=2,
         help="Independent scoring runs per pilot×line in scoring+lines mode (default: 2)",
     )
-    parser.add_argument("--output",   default="results.html", help="Output file")
+    parser.add_argument("--output",   default=os.path.join(RESULTS_DIR, "results.html"), help="Output file")
     args = parser.parse_args()
 
     config = {

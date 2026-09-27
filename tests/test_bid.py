@@ -10,7 +10,7 @@ import os
 import sys
 from types import SimpleNamespace
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 
 import metrics as M
 from bid import Bid, oracle_bid, rank_pairings, roc_weights, score_pairings

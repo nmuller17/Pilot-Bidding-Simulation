@@ -25,6 +25,7 @@ from datetime import date
 
 from harness import ExperimentRunner, LLMSettings
 from llm_client import LLMClient, StubClient
+from paths import RESULTS_DIR
 from pbs_instance import PBSInstance
 from strategies.column_bid import MODES, REGIMES, WEIGHT_FORMATS, ColumnBid
 
@@ -95,7 +96,7 @@ def main(argv=None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="answer every prompt from the oracle; no API calls")
     ap.add_argument("--on-error", choices=["raise", "record"], default="record")
-    ap.add_argument("--out", default="pbs_results.json")
+    ap.add_argument("--out", default=os.path.join(RESULTS_DIR, "pbs_results.json"))
     args = ap.parse_args(argv)
 
     for stream in (sys.stdout, sys.stderr):

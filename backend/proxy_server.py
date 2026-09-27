@@ -2,10 +2,10 @@
 """
 Local backend for pilot_bidding POC.
 
-- Serves pilot_bidding_poc.html from this directory (same origin as fetch).
+- Serves frontend/pilot_bidding_poc.html (same origin as fetch).
 - Proxies POST /api/llm → OpenAI or Anthropic using keys from the machine only.
 
-Secrets: `.env` beside this script (see `env.example`) or exported env vars:
+Secrets: `.env` at the project root (see `.env.example`) or exported env vars:
 
   OPENAI_API_KEY / ANTHROPIC_API_KEY   — whichever provider you use
   LLM_PROVIDER=anthropic|openai         — optional; inferred from keys if omitted
@@ -14,7 +14,7 @@ Secrets: `.env` beside this script (see `env.example`) or exported env vars:
 The browser never chooses provider/model; `/api/llm` ignores client overrides.
 
 Install: pip install openai anthropic python-dotenv
-Run: python proxy_server.py
+Run: python backend/proxy_server.py
 
 Optional: PILOT_BIDDING_PROXY_PORT=8765
 
@@ -31,18 +31,19 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import urlparse
 
+from paths import ENV_FILE, FRONTEND_DIR
+
 try:
     from dotenv import load_dotenv
 
-    _HERE = os.path.dirname(os.path.abspath(__file__))
-    load_dotenv(os.path.join(_HERE, ".env"))
+    load_dotenv(ENV_FILE)
 except ImportError:
     pass
 
 from llm_api import call_llm
 
 _PORT = int(os.environ.get("PILOT_BIDDING_PROXY_PORT", "8765"))
-_ROOT = os.path.dirname(os.path.abspath(__file__))
+_ROOT = FRONTEND_DIR
 _DEFAULT_OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o").strip() or "gpt-4o"
 _DEFAULT_ANTHROPIC_MODEL = (
     os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929").strip()

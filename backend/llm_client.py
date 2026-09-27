@@ -41,10 +41,12 @@ from typing import Optional
 
 # main.py never loaded .env, so `python main.py --auto` required exported env
 # vars. The harness loads it, which affects only the new code paths.
+from paths import ENV_FILE
+
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    load_dotenv(ENV_FILE)
 except ImportError:  # pragma: no cover - optional dependency
     pass
 

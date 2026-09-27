@@ -69,12 +69,12 @@ The easiest way to explore the simulation is the **browser-based UI** — no pro
 
 ### Setup (one time, requires Python)
 
-1. In the `pilot_bidding` folder, run: `pip install -r requirements-backend.txt`
-2. Copy `env.example` to `.env` and add your AI provider key (OpenAI or Anthropic/Claude)
-3. Start the local server: `python proxy_server.py`
+1. From the project root, run: `pip install -r backend/requirements.txt`
+2. Copy `.env.example` to `.env` (project root) and add your AI provider key (OpenAI or Anthropic/Claude)
+3. Start the local server: `python backend/proxy_server.py`
 4. Open your browser to: `http://127.0.0.1:8765/pilot_bidding_poc.html`
 
-> **No API key?** Open `pilot_bidding_poc.html` directly in your browser. You can still generate prompts manually, paste them into any AI chat (ChatGPT, Claude, etc.), and paste the response back. All metrics are computed automatically.
+> **No API key?** Open `frontend/pilot_bidding_poc.html` directly in your browser. You can still generate prompts manually, paste them into any AI chat (ChatGPT, Claude, etc.), and paste the response back. All metrics are computed automatically.
 
 ---
 
@@ -214,16 +214,33 @@ The sections below are intended for developers and researchers working with the 
 ## Code structure
 
 ```
-pilot_bidding/
-├── models.py          # Dataclasses: Pilot, Pairing, Leg, OracleWeights, etc.
-├── generator.py       # Deterministic scenario generation (pilots + pairings)
-├── oracle.py          # Oracle scoring and ranking logic
-├── prompt_builder.py  # LLM prompt generation (oracle, pairwise, scoring modes)
-├── evaluator.py       # Evaluation metrics: Spearman ρ, top-1, eligibility accuracy
-├── allocator.py       # Seniority-order allocation with tiebreak tracking
-├── main.py            # End-to-end runner (manual and automated modes)
+Pilot-Bidding-Simulation/
+├── backend/                  # Python simulation, LLM clients and local server
+│   ├── models.py             # Dataclasses: Pilot, Pairing, Leg, OracleWeights, etc.
+│   ├── generator.py          # Deterministic scenario generation (pilots + pairings)
+│   ├── oracle.py             # Oracle scoring and ranking logic
+│   ├── prompt_builder.py     # LLM prompt generation (oracle, pairwise, scoring modes)
+│   ├── evaluator.py          # Evaluation metrics: Spearman ρ, top-1, eligibility accuracy
+│   ├── allocator.py          # Seniority-order allocation with tiebreak tracking
+│   ├── features.py, instructions.py, bid.py, bid_prompts.py,
+│   │   pbs_instance.py, metrics.py, harness.py, oracle_responder.py   # PBS pipeline (see below)
+│   ├── llm_api.py, llm_client.py   # LLM provider clients
+│   ├── strategies/           # Ranking / bidding strategies
+│   ├── paths.py              # Project directory layout (frontend/, data/, .env)
+│   ├── main.py               # End-to-end runner (manual and automated modes)
+│   ├── run_pbs_experiment.py # PBS experiment runner
+│   ├── proxy_server.py       # Serves the frontend and proxies /api/llm
+│   └── requirements.txt
+├── frontend/
+│   └── pilot_bidding_poc.html  # Browser UI (standalone HTML/JS)
+├── data/
+│   └── results/              # Generated reports and JSON results
+├── tests/
+├── .env.example              # Copy to .env (never commit .env)
 └── README.md
 ```
+
+Scripts can be run from any directory; generated output goes to `data/results/` by default.
 
 ---
 
@@ -231,32 +248,32 @@ pilot_bidding/
 
 ### Manual mode (paste prompts to any LLM, no API key needed)
 ```bash
-python main.py --pilots 5 --pairings 5
+python backend/main.py --pilots 5 --pairings 5
 ```
 
 ### Automated mode (requires API key)
 ```bash
 # OpenAI
-OPENAI_API_KEY=sk-... python main.py --auto --model gpt-4o
+OPENAI_API_KEY=sk-... python backend/main.py --auto --model gpt-4o
 
 # Anthropic
-ANTHROPIC_API_KEY=sk-ant-... python main.py --auto --provider anthropic --model claude-haiku-4-5-20251001
+ANTHROPIC_API_KEY=sk-ant-... python backend/main.py --auto --provider anthropic --model claude-haiku-4-5-20251001
 
 # More pilots and pairings
-OPENAI_API_KEY=sk-... python main.py --auto --pilots 10 --pairings 20 --model gpt-4o-mini
+OPENAI_API_KEY=sk-... python backend/main.py --auto --pilots 10 --pairings 20 --model gpt-4o-mini
 ```
 
 ### Full backend + UI setup
 ```bash
-cd pilot_bidding
-pip install -r requirements-backend.txt
-# Copy env.example to .env and fill in one API key and set LLM_PROVIDER
-python proxy_server.py
+pip install -r backend/requirements.txt
+# Copy .env.example to .env and fill in one API key and set LLM_PROVIDER
+python backend/proxy_server.py
 # Then open http://127.0.0.1:8765/pilot_bidding_poc.html
 ```
 
 ### Line mode via Python API
 ```python
+# run from backend/ (or add it to sys.path)
 from generator import ScenarioGenerator
 gen      = ScenarioGenerator()
 pilots   = gen.build_pilots(n=5)
@@ -493,11 +510,11 @@ The bid-line code above ranks whole monthly lines. The PBS pipeline instead has 
 
 ```bash
 # no API calls: every variant, answered from the oracle (budget variants must give rho = 1)
-python run_pbs_experiment.py --all-variants --dry-run
+python backend/run_pbs_experiment.py --all-variants --dry-run
 
 # real runs (model from .env, e.g. claude-sonnet-5 on Parley)
-python run_pbs_experiment.py --variants separated:R1:budget joint:R1:budget \
-    separated:R2:budget separated:R3:budget separated:R4:budget --reps 3 --out pbs_results.json
+python backend/run_pbs_experiment.py --variants separated:R1:budget joint:R1:budget \
+    separated:R2:budget separated:R3:budget separated:R4:budget --reps 3 --out data/results/pbs_results.json
 ```
 
 **Bid-form oracle.** The base oracle's four weights (per archetype, sum 100) are rescaled to the budget B (default 10) over the columns `tafb`, `hotel_nights` (σ = −1 for family pilots, +1 otherwise), `report_earliness` (minutes before 07:00, which reproduces the base oracle's flat-after-07:00 report score) and `credit_pay`. Each soft instruction takes a designer-chosen share of B, split over its columns; an instruction on a base column with the opposite direction (e.g. "long trips") overrides it. Firm instructions become hard exclusions (those pairings go to the bottom, flagged *avoid*); schedule-level wishes become schedule preferences for the solver. Instructions are capped at 60% of B. Without instructions, the bid-form oracle's pairing ranking tracks `oracle_rank_pilot` at ρ ≈ 0.76–0.99 (the gap comes from normalising over J instead of fixed bounds).

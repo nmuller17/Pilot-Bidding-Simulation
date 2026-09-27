@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 
 from bid import oracle_bid, rank_pairings
 from features import FeatureLibrary, FeatureMatrix

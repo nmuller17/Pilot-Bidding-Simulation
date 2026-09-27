@@ -22,7 +22,7 @@ import sys
 import zlib
 from typing import Dict, List, Sequence
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend"))
 
 # The pre-existing progress prints contain non-ASCII characters (≤, ρ, ⚠).
 # On Windows the console defaults to cp1252 and those raise UnicodeEncodeError
